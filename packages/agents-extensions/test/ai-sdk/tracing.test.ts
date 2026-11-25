@@ -141,3 +141,159 @@ test.each([false, true])(
     );
   },
 );
+
+test.each([
+  [false, true],
+  [true, true],
+  [false, 'enabled_without_data' as const],
+  [true, 'enabled_without_data' as const],
+])(
+  'records offered tools on AI SDK generation spans only with sensitive data (stream: %s, tracing: %s)',
+  async (stream, tracing) => {
+    const processor = new RecordingProcessor();
+    setTraceProcessors([processor]);
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal('fetch', fetchMock);
+    const finish = {
+      type: 'finish',
+      finishReason: 'stop',
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    };
+    // Simulate a provider that rewrites request schemas in place during dispatch.
+    const rewriteTools = (options: any) => {
+      for (const tool of options.tools ?? []) {
+        tool.description = 'rewritten-by-provider';
+      }
+    };
+    const model = new AiSdkModel(
+      stubModel({
+        async doGenerate(options: any) {
+          rewriteTools(options);
+          return {
+            content: [{ type: 'text', text: 'ok' }],
+            usage: finish.usage,
+            finishReason: 'stop',
+            warnings: [],
+          };
+        },
+        async doStream(options: any) {
+          rewriteTools(options);
+          return {
+            stream: ReadableStream.from([
+              { type: 'text-start', id: 't1' },
+              { type: 'text-delta', id: 't1', delta: 'ok' },
+              { type: 'text-end', id: 't1' },
+              finish,
+            ]),
+          } as any;
+        },
+      }),
+    );
+    const request: ModelRequest = {
+      input: 'hi',
+      modelSettings: {},
+      tools: [
+        {
+          type: 'function',
+          name: 'get_weather',
+          description: 'synthetic-tool-description',
+          parameters: {
+            type: 'object',
+            properties: { city: { type: 'string' } },
+            required: ['city'],
+            additionalProperties: false,
+          },
+          strict: true,
+        } as any,
+      ],
+      handoffs: [
+        {
+          toolName: 'transfer_to_billing',
+          toolDescription: 'synthetic-handoff-description',
+          inputJsonSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+            additionalProperties: false,
+          },
+          strictJsonSchema: true,
+        } as any,
+      ],
+      outputType: 'text',
+      tracing,
+    };
+    await withTrace('synthetic-ai-sdk-tools', async () => {
+      if (stream) {
+        for await (const _event of model.getStreamedResponse(request)) {
+          // drain
+        }
+      } else await model.getResponse(request);
+    });
+    const span = processor.spans.find(
+      (item) => item.spanData.type === 'generation',
+    )!;
+    expect(span).toBeDefined();
+
+    if (tracing !== true) {
+      expect(span.spanData.tools).toBeUndefined();
+      return;
+    }
+
+    expect(span.spanData.tools).toEqual([
+      expect.objectContaining({
+        type: 'function',
+        name: 'get_weather',
+        description: 'synthetic-tool-description',
+        inputSchema: expect.objectContaining({ required: ['city'] }),
+      }),
+      expect.objectContaining({
+        type: 'function',
+        name: 'transfer_to_billing',
+        description: 'synthetic-handoff-description',
+      }),
+    ]);
+
+    await new OpenAITracingExporter({ apiKey: 'synthetic-key' }).export([span]);
+    expect(fetchMock.mock.calls[0][1].body).not.toContain(
+      'synthetic-tool-description',
+    );
+    await new OpenAITracingExporter({
+      apiKey: 'synthetic-key',
+      endpoint: 'https://example.test/ingest',
+    }).export([span]);
+    expect(fetchMock.mock.calls[1][1].body).toContain(
+      'synthetic-tool-description',
+    );
+  },
+);
+
+test('does not record tools on AI SDK generation spans when none are offered', async () => {
+  const processor = new RecordingProcessor();
+  setTraceProcessors([processor]);
+  const model = new AiSdkModel(
+    stubModel({
+      async doGenerate() {
+        return {
+          content: [{ type: 'text', text: 'ok' }],
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          finishReason: 'stop',
+          warnings: [],
+        };
+      },
+    }),
+  );
+  await withTrace('synthetic-ai-sdk-no-tools', async () => {
+    await model.getResponse({
+      input: 'hi',
+      modelSettings: {},
+      tools: [],
+      handoffs: [],
+      outputType: 'text',
+      tracing: true,
+    });
+  });
+  const span = processor.spans.find(
+    (item) => item.spanData.type === 'generation',
+  )!;
+  expect(span.spanData.tools).toBeUndefined();
+});

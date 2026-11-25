@@ -502,6 +502,33 @@ function isPlainRecord(value: unknown): value is Record<string, any> {
   return prototype === Object.prototype || prototype === null;
 }
 
+/**
+ * Records the tool definitions offered to the model on the generation span.
+ * Only runs when sensitive data capture is enabled, and snapshots the final
+ * request tools (after `providerData` overrides) before dispatch so a provider
+ * that rewrites schemas in place cannot change what the trace recorded.
+ */
+function recordOfferedTools(
+  span: { spanData: { tools?: Array<Record<string, any>> } } | undefined,
+  request: ModelRequest,
+  aiSdkRequest: LanguageModelV2CallOptionsCompat,
+): void {
+  const tools = aiSdkRequest.tools;
+  if (
+    !span ||
+    request.tracing !== true ||
+    !Array.isArray(tools) ||
+    tools.length === 0
+  ) {
+    return;
+  }
+  try {
+    span.spanData.tools = structuredClone(tools) as Array<Record<string, any>>;
+  } catch {
+    // A provider-specific value that cannot be copied must not prevent dispatch.
+  }
+}
+
 function getAiSdkProviderData(
   model: LanguageModelCompatible,
   modelSettings: ModelSettings,
@@ -985,6 +1012,8 @@ export class AiSdkModel implements Model {
           ...getAiSdkProviderData(this.#model, request.modelSettings),
         };
 
+        recordOfferedTools(span, request, aiSdkRequest);
+
         if (this.#logger.dontLogModelData) {
           this.#logger.debug('Request sent');
         } else {
@@ -1270,6 +1299,8 @@ export class AiSdkModel implements Model {
         ...getAiSdkProviderData(this.#model, request.modelSettings),
       };
       const requestedToolsByName = resolvedRequestedTools.toolsByName;
+
+      recordOfferedTools(span, request, aiSdkRequest);
 
       if (this.#logger.dontLogModelData) {
         this.#logger.debug('Request received (streamed)');
